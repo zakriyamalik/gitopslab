@@ -1,4 +1,4 @@
-name: Deploy Infrastructure and GitOps
+name: GitOpsLab CI/CD Pipeline
 
 on:
   push:
@@ -6,19 +6,94 @@ on:
     paths:
       - 'terraform/**'
       - 'k8s/**'
+      - '.github/workflows/deploy.yaml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
 
 env:
   ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
   ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
   ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  TF_VAR_environment: ${{ github.event.inputs.environment || 'dev' }}
 
 jobs:
-  deploy:
+  # JOB 1: Validate Terraform
+  terraform-validate:
+    name: 'Terraform Validate'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+      
+      - name: Terraform Validate
+        run: |
+          cd terraform
+          terraform validate
+      
+      - name: Terraform Format Check
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+
+  # JOB 2: Plan Infrastructure
+  terraform-plan:
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+      
+      - name: Terraform Plan
+        run: |
+          cd terraform
+          terraform plan -no-color
+        continue-on-error: false
+
+  # JOB 3: Apply Infrastructure
+  terraform-apply:
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
       
       - name: Setup Terraform
@@ -36,46 +111,178 @@ jobs:
           cd terraform
           terraform apply -auto-approve
       
-      - name: Get kubeconfig
+      - name: Get Master IP
+        id: get-ip
         run: |
-          MASTER_IP=$(terraform -chdir=terraform output -raw master_ip)
-          mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no azureuser@$MASTER_IP "sudo cat /etc/kubernetes/admin.conf" > ~/.kube/config
+          cd terraform
+          echo "MASTER_IP=$(terraform output -raw master_ip)" >> $GITHUB_OUTPUT
       
-      - name: Install Helm
+      - name: Save kubeconfig
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          
+          # Wait for SSH to be ready
+          for i in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 azureuser@${{ steps.get-ip.outputs.MASTER_IP }} "echo 'SSH ready'" 2>/dev/null; then
+              break
+            fi
+            echo "Waiting for SSH... ($i/30)"
+            sleep 10
+          done
+          
+          # Get kubeconfig
+          ssh -o StrictHostKeyChecking=no azureuser@${{ steps.get-ip.outputs.MASTER_IP }} "sudo cat /etc/kubernetes/admin.conf" > kubeconfig.yaml
+          
+          # Upload as artifact
+          echo "KUBECONFIG<<EOF" >> $GITHUB_ENV
+          cat kubeconfig.yaml >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      
+      - name: Upload kubeconfig
+        uses: actions/upload-artifact@v3
+        with:
+          name: kubeconfig
+          path: kubeconfig.yaml
+          retention-days: 7
+
+  # JOB 4: Install GitOps Stack
+  install-gitops:
+    name: 'Install ArgoCD & Monitoring'
+    runs-on: ubuntu-latest
+    needs: terraform-apply
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download kubeconfig
+        uses: actions/download-artifact@v3
+        with:
+          name: kubeconfig
+          path: /tmp
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Wait for cluster
+        run: |
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+          # Wait for nodes
+          kubectl wait --for=condition=ready node --all --timeout=300s || true
+          # Wait for coreDNS
+          kubectl wait --for=condition=available --timeout=300s deployment/coredns -n kube-system || true
+      
+      - name: Setup Helm
         uses: azure/setup-helm@v3
       
       - name: Add Helm repos
         run: |
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add argo https://argoproj.github.io/argo-helm
           helm repo update
       
       - name: Install ArgoCD
         run: |
+          export KUBECONFIG=/tmp/kubeconfig.yaml
           kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
           kubectl apply -n argocd -f k8s/argocd/install.yaml
           kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd || true
       
-      - name: Install Monitoring via Helm
+      - name: Install Monitoring
         run: |
+          export KUBECONFIG=/tmp/kubeconfig.yaml
           kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
           helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
             --namespace monitoring \
             --values k8s/apps/monitoring/helm-values.yaml \
             --set grafana.service.type=NodePort \
-            --set grafana.service.nodePort=32000
+            --set grafana.service.nodePort=32000 \
+            --wait
       
       - name: Apply ArgoCD Applications
         run: |
-          kubectl apply -f k8s/applications.yaml
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+          # Wait for ArgoCD CRDs
+          sleep 30
+          kubectl apply -f k8s/applications.yaml || true
       
-      - name: Output access information
+      - name: Get ArgoCD Password
+        id: argocd
         run: |
-          MASTER_IP=$(terraform -chdir=terraform output -raw master_ip)
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+          PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+          echo "password=$PASSWORD" >> $GITHUB_OUTPUT
+      
+      - name: Output Access Information
+        run: |
+          MASTER_IP=$(cd terraform && terraform output -raw master_ip)
           echo "=========================================="
-          echo "✅ Deployment Complete!"
+          echo "✅ DEPLOYMENT COMPLETE!"
           echo "=========================================="
           echo "Grafana: http://$MASTER_IP:32000"
-          echo "Username: admin"
-          echo "Password: prom-operator"
+          echo "  Username: admin"
+          echo "  Password: prom-operator"
+          echo ""
+          echo "ArgoCD: http://$MASTER_IP:30080"
+          echo "  Username: admin"
+          echo "  Password: ${{ steps.argocd.outputs.password }}"
           echo "=========================================="
+
+  # JOB 5: Setup Backup (Optional)
+  setup-backup:
+    name: 'Setup Automated Backups'
+    runs-on: ubuntu-latest
+    needs: install-gitops
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download kubeconfig
+        uses: actions/download-artifact@v3
+        with:
+          name: kubeconfig
+          path: /tmp
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Create backup CronJob
+        run: |
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+          kubectl apply -f - <<EOF
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: etcd-backup
+            namespace: kube-system
+          spec:
+            schedule: "0 2 * * *"
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    containers:
+                    - name: backup
+                      image: bitnami/etcd:3.5.9
+                      command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snapshot-\$(date +%%Y%%m%%d-%%H%%M%%S).db \
+                          --endpoints=https://\$(KUBERNETES_SERVICE_HOST):2379 \
+                          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                          --cert=/etc/kubernetes/pki/etcd/server.crt \
+                          --key=/etc/kubernetes/pki/etcd/server.key
+                      volumeMounts:
+                      - name: backup
+                        mountPath: /backup
+                    restartPolicy: OnFailure
+                    volumes:
+                    - name: backup
+                      hostPath:
+                        path: /var/backups/etcd
+                        type: DirectoryOrCreate
+          EOF
