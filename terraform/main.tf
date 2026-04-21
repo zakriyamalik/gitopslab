@@ -108,8 +108,8 @@ resource "azurerm_linux_virtual_machine" "worker" {
   network_interface_ids = [azurerm_network_interface.worker[count.index].id]
 
   admin_ssh_key {
-    username   = var.admin_username
-    public_key = file(var.ssh_public_key_path)
+  username   = var.admin_username
+  public_key = var.ssh_public_key
   }
 
   os_disk {
