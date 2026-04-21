@@ -1,0 +1,65 @@
+# Prometheus + Grafana values from your existing setup
+grafana:
+  enabled: true
+  service:
+    type: NodePort
+    nodePort: 32000
+  adminPassword: prom-operator
+  persistence:
+    enabled: true
+    size: 10Gi
+
+prometheus:
+  enabled: true
+  prometheusSpec:
+    retention: 10d
+    retentionSize: 50GB
+    resources:
+      requests:
+        memory: 512Mi
+        cpu: 500m
+      limits:
+        memory: 2Gi
+        cpu: 1000m
+
+alertmanager:
+  enabled: true
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname']
+      group_wait: 10s
+      group_interval: 10s
+      repeat_interval: 1h
+      receiver: 'null'
+    receivers:
+    - name: 'null'
+
+kube-state-metrics:
+  enabled: true
+
+node-exporter:
+  enabled: true
+
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: true
+    configReloaders: true
+    general: true
+    k8s: true
+    kubeApiserver: true
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: true
+    prometheusOperator: true

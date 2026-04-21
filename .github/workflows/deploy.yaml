@@ -1,0 +1,81 @@
+name: Deploy Infrastructure and GitOps
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - 'k8s/**'
+  workflow_dispatch:
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+      
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve
+      
+      - name: Get kubeconfig
+        run: |
+          MASTER_IP=$(terraform -chdir=terraform output -raw master_ip)
+          mkdir -p ~/.kube
+          ssh -o StrictHostKeyChecking=no azureuser@$MASTER_IP "sudo cat /etc/kubernetes/admin.conf" > ~/.kube/config
+      
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+      
+      - name: Add Helm repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+      
+      - name: Install ArgoCD
+        run: |
+          kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -n argocd -f k8s/argocd/install.yaml
+          kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd || true
+      
+      - name: Install Monitoring via Helm
+        run: |
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --values k8s/apps/monitoring/helm-values.yaml \
+            --set grafana.service.type=NodePort \
+            --set grafana.service.nodePort=32000
+      
+      - name: Apply ArgoCD Applications
+        run: |
+          kubectl apply -f k8s/applications.yaml
+      
+      - name: Output access information
+        run: |
+          MASTER_IP=$(terraform -chdir=terraform output -raw master_ip)
+          echo "=========================================="
+          echo "✅ Deployment Complete!"
+          echo "=========================================="
+          echo "Grafana: http://$MASTER_IP:32000"
+          echo "Username: admin"
+          echo "Password: prom-operator"
+          echo "=========================================="
