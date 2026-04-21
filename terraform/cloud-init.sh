@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Variables passed from Terraform
+admin_username="${admin_username}"
+
 # Install container runtime
 apt-get update
 apt-get install -y containerd
@@ -26,22 +29,25 @@ swapoff -a
 sed -i '/ swap / s/^/#/' /etc/fstab
 
 if [ "${role}" = "master" ]; then
-  # Initialize cluster
+  # Initialize cluster with pod CIDR
   kubeadm init --pod-network-cidr=192.168.0.0/16
   
-  # Configure kubectl for azureuser
+  # Configure kubectl
   mkdir -p /home/${admin_username}/.kube
   cp /etc/kubernetes/admin.conf /home/${admin_username}/.kube/config
   chown -R ${admin_username}:${admin_username} /home/${admin_username}/.kube
   
-  # Install Calico network
-  su - ${admin_username} -c "kubectl --kubeconfig=/home/${admin_username}/.kube/config apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26/manifests/calico.yaml"
+  # Install Calico
+  su - ${admin_username} -c "kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26/manifests/calico.yaml"
   
-  # Generate join command for workers
+  # Create join command for workers
   kubeadm token create --print-join-command > /home/${admin_username}/join-command.sh
   chmod +x /home/${admin_username}/join-command.sh
+  
+  # Wait for Calico to be ready
+  sleep 60
 else
-  # Worker nodes - wait for master to be ready
-  # Join command will be provided separately
-  sleep 30
+  # Worker nodes - they will join via the master
+  # In production, you'd pass the join command from master
+  sleep 120
 fi

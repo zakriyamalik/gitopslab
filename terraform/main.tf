@@ -79,7 +79,8 @@ resource "azurerm_linux_virtual_machine" "master" {
   }
 
   custom_data = base64encode(templatefile("${path.module}/cloud-init.sh", {
-    role = "master"
+    role           = "master"
+    admin_username = var.admin_username
   }))
 }
 
@@ -125,6 +126,7 @@ resource "azurerm_linux_virtual_machine" "worker" {
   }
 
   custom_data = base64encode(templatefile("${path.module}/cloud-init.sh", {
-    role = "worker"
+    role           = "worker"
+    admin_username = var.admin_username
   }))
 }
